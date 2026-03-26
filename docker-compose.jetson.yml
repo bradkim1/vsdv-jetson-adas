@@ -1,0 +1,33 @@
+# Run on Jetson Nano (bk-jetson)
+version: "3.8"
+services:
+  kuksa-databroker:
+    image: ghcr.io/eclipse-kuksa/kuksa-databroker:latest
+    container_name: kuksa-databroker
+    ports:
+      - "55555:55555"
+    command: ["--port", "55555", "--insecure"]
+    networks:
+      - vsdv-net
+    restart: unless-stopped
+
+  adas-inference:
+    build: ./adas
+    container_name: vsdv-adas
+    runtime: nvidia
+    environment:
+      - NVIDIA_VISIBLE_DEVICES=all
+    volumes:
+      - trt-models:/app/models
+    networks:
+      - vsdv-net
+    depends_on:
+      - kuksa-databroker
+    restart: unless-stopped
+
+volumes:
+  trt-models:
+
+networks:
+  vsdv-net:
+    external: true

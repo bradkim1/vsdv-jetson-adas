@@ -1,0 +1,13 @@
+# Run on Host (RTX 5090)
+version: "3.8"
+services:
+  vehicle-simulator:
+    build: ./simulator
+    container_name: vsdv-simulator
+    networks:
+      - vsdv-net
+    restart: unless-stopped
+
+networks:
+  vsdv-net:
+    external: true
