@@ -17,8 +17,11 @@ services:
     runtime: nvidia
     environment:
       - NVIDIA_VISIBLE_DEVICES=all
+      - ADAS_MODE=${ADAS_MODE:-synthetic}   # set to "carla" when CARLA is running
+      - CARLA_HOST=${CARLA_HOST:-192.168.55.100}
+      - CARLA_CAM_PORT=9999
     volumes:
-      - trt-models:/app/models
+      - trt-models:/app
     networks:
       - vsdv-net
     depends_on:
