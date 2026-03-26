@@ -2,7 +2,7 @@
 # Launch CARLA server headless on RTX 5090
 # Then start the Kuksa bridge
 
-CARLA_PATH="${CARLA_PATH:-/home/bk/carla/CARLA_0.9.15}"
+CARLA_PATH="${CARLA_PATH:-/home/bk/carla}"
 
 echo "[CARLA] Starting headless server..."
 
