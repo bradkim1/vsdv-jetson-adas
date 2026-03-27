@@ -30,11 +30,11 @@ FPS_TARGET  = 10
 COLLISION_THRESHOLD = 5.0  # metres
 
 ADAS_SIGNALS = {
-    "Vehicle.ADAS.ObstacleDetected":        "bool",
-    "Vehicle.ADAS.ObstacleCount":           "uint32",
-    "Vehicle.ADAS.NearestObstacleDistance": "float",
-    "Vehicle.ADAS.CollisionWarning":        "bool",
-    "Vehicle.ADAS.InferenceLatencyMs":      "float",
+    "Vehicle.ADAS.ObstacleDetection.IsActive":  "bool",    # obstacle detected
+    "Vehicle.ADAS.ObstacleDetection.IsWarning": "bool",    # collision warning
+    "Vehicle.ADAS.EBA.IsEngaged":               "bool",    # emergency brake assist
+    "Vehicle.Chassis.Brake.PedalPosition":      "uint8",   # nearest distance encoded as brake hint (0-100)
+    "Vehicle.ADAS.CruiseControl.SpeedSet":      "float",   # reuse for inference latency ms
 }
 
 # Shared frame queue between receiver thread and inference loop
@@ -116,19 +116,21 @@ def generate_synthetic_frame(frame_id: int):
 async def publish_to_kuksa(stub, detections: dict):
     from kuksa.val.v1 import val_pb2, types_pb2
     updates = []
+    # Encode nearest distance as 0-100 brake hint (100=closest)
+    dist_pct = max(0, min(100, int((10.0 - min(detections["nearest_distance"], 10.0)) * 10)))
     values = {
-        "Vehicle.ADAS.ObstacleDetected":        detections["obstacle_detected"],
-        "Vehicle.ADAS.ObstacleCount":           detections["obstacle_count"],
-        "Vehicle.ADAS.NearestObstacleDistance": detections["nearest_distance"],
-        "Vehicle.ADAS.CollisionWarning":        detections["collision_warning"],
-        "Vehicle.ADAS.InferenceLatencyMs":      detections["latency_ms"],
+        "Vehicle.ADAS.ObstacleDetection.IsActive":  detections["obstacle_detected"],
+        "Vehicle.ADAS.ObstacleDetection.IsWarning": detections["collision_warning"],
+        "Vehicle.ADAS.EBA.IsEngaged":               detections["collision_warning"],
+        "Vehicle.Chassis.Brake.PedalPosition":      dist_pct,
+        "Vehicle.ADAS.CruiseControl.SpeedSet":      detections["latency_ms"],
     }
     for path, value in values.items():
         dp = types_pb2.Datapoint()
         sig_type = ADAS_SIGNALS[path]
         if sig_type == "bool":
             dp.bool = bool(value)
-        elif sig_type == "uint32":
+        elif sig_type == "uint8":
             dp.uint32 = int(value)
         elif sig_type == "float":
             dp.float = float(value)
