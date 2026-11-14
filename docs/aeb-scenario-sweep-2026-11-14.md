@@ -74,6 +74,80 @@ Inference latency: mean **20.6 ms**, worst frame 25.5 ms. Compute is not the bot
    against a 4.3 m stopping distance leaves ~1.5 m, and frame-timing jitter in the async
    loop is enough to flip the result.
 
+## Fixes applied and re-measured (same day)
+
+Two findings above were actionable in software and were fixed, then the identical
+24-scenario sweep was re-run on the same board.
+
+**Per-class heights.** A single distance constant was replaced by
+`focal_px * height_m(class) / box_px`, with focal length derived from frame width and
+FOV, and heights from a COCO class-id table.
+
+**Hysteresis, two layers.** Perception holds a lost object for 0.6 s, coasting the last
+measurement forward at the closing speed instead of declaring the road clear. The
+vehicle app latches an engaged emergency stop and releases it only after 1.0 s of
+continuous clear or an actual stop.
+
+**A third fix was forced by the first two.** Adding hysteresis to the device under test
+invalidated the harness, which had assumed state decays on its own: the scenario reset
+slept 0.4 s while the perception track holds for 0.6 s, so a run could begin with the
+previous scenario's obstacle still held. The car braked from t=0 and stopped before the
+new obstacle was ever in range, which scored as "avoided, never detected" — a PASSING
+result, the dangerous kind. The reset now pins speed to zero and polls until the device
+itself reports a clear road with the brake released. The first post-fix sweep was
+discarded as contaminated; the numbers below are from a clean re-run with zero settle
+warnings.
+
+### Before / after, 24 paired scenarios
+
+| metric | before | after | delta |
+|---|---|---|---|
+| Collisions | 9 | 8 | -1 |
+| Avoided | 14 | 15 | +1 |
+| Timeouts | 1 | 1 | 0 |
+| Brake releases | 24 | 16 | **-8** |
+| "Avoided" stopping within 2 m | 6 | 4 | -2 |
+| Cumulative impact speed (km/h) | 414.1 | 396.5 | -17.6 |
+| Pedestrian distance error | +53.4% | +42.6% | |
+| Vehicle distance error | -36.9% | -15.0% | |
+
+**The latch works where it was designed to.** Pedestrian brake releases went 5 to 0 —
+every one of those was a cancelled emergency stop. Vehicle releases only moved 19 to 16,
+because at 27 m the vehicle app is in partial braking, which the latch deliberately does
+not hold. That is brake chatter, not cancelled emergency braking.
+
+One scenario improved outright (pedestrian, 30 km/h, 80 m, dusk: collision at 9.0 km/h
+to avoided). One cell appears to regress, but the daylight variant of the same cell moved
+the opposite way — it is the same nondeterministic 50 km/h vehicle timeout moving around,
+still unexplained.
+
+### The residual distance error is not the formula
+
+The sweep average only moved to +42.6% for pedestrians, which looks like the fix
+underperforming. Measuring the detected box against the drawn sprite shows otherwise:
+
+| case | drawn px | box px | box/drawn | error |
+|---|---|---|---|---|
+| person @6 m | 93.3 | 90.5 | 0.97 | +3% |
+| vehicle @6 m | 170.7 | 168.9 | 0.99 | +1% |
+| vehicle @8 m | 128.0 | 127.9 | 1.00 | 0% |
+| vehicle @10 m | 102.4 | 102.8 | 1.00 | -0% |
+| vehicle @15 m | 68.3 | 44.6 | 0.65 | +53% |
+| vehicle @20 m | 51.2 | 32.8 | 0.64 | +56% |
+
+With a correct class and a tight box the geometry is now **exact, 0 to 3%**. The
+remaining error is box quality collapsing at range — the detector covers roughly 65% of
+the object at 15 to 20 m — plus misclassification. That is a perception-quality problem,
+not a geometry one.
+
+### What the fixes could not do
+
+Pedestrian collisions went 9 to 8 and the envelope is unchanged: all-clear only at
+30 km/h, collisions from 50 km/h, worst impact 64.2 km/h. This was expected. Detection at
+4 to 7 m against a 23.6 m stopping distance is a **sensor** limit, and no control-side fix
+reaches it. The camera configuration remains the finding that matters, and it needs
+hardware rather than code.
+
 ## What this does not show
 
 - **The dusk dimension is weak evidence.** Light level had no systematic effect — dusk
@@ -120,7 +194,10 @@ python3 envelope.py
 
 ## Next
 
-- Per-class object heights for the distance estimator
-- Detection hysteresis or a tracker, so one dropped frame cannot cancel a stop
-- Re-run the camera trade study in CARLA, where imagery is photorealistic
+- ~~Per-class object heights for the distance estimator~~ — done, geometry now exact
+- ~~Detection hysteresis, so one dropped frame cannot cancel a stop~~ — done, 5 to 0 on pedestrians
+- Hysteresis on the graduated braking bands, to stop partial-brake chatter (16 releases remain)
+- Re-run the camera trade study in CARLA or Isaac Sim, where imagery is photorealistic
 - Sweep the camera configuration in closed loop (needs the engine re-exported per resolution)
+- Close the agent loop: today the sweep grid is typed by hand; the verdict records already
+  carry what a chooser needs to refine around the failure boundary automatically
