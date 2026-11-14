@@ -102,18 +102,33 @@ def main():
               f"   dropouts {drops}   brake releases {rels}")
 
     # ── the headline ─────────────────────────────────────────────────────────
+    NEAR_MISS_M = 2.0
     print("\n── envelope " + "─" * 55)
     for obst, rows in sorted(by_obst.items()):
-        safe = [r["spec"]["ego_speed_kmh"] for r in rows if r["outcome"] != "COLLISION"]
-        unsafe = [r["spec"]["ego_speed_kmh"] for r in rows if r["outcome"] == "COLLISION"]
-        if safe and unsafe:
-            print(f"  {obst:<8} avoided up to {max(safe):.0f} km/h; "
-                  f"first collision at {min(unsafe):.0f} km/h")
-        elif safe:
-            print(f"  {obst:<8} avoided at every speed tested (max {max(safe):.0f} km/h)")
+        speeds = sorted({r["spec"]["ego_speed_kmh"] for r in rows})
+        # A speed only counts as clear if EVERY run at it avoided collision.
+        clear = [sp for sp in speeds
+                 if all(r["outcome"] != "COLLISION"
+                        for r in rows if r["spec"]["ego_speed_kmh"] == sp)]
+        hit = [sp for sp in speeds
+               if any(r["outcome"] == "COLLISION"
+                      for r in rows if r["spec"]["ego_speed_kmh"] == sp)]
+        if hit:
+            print(f"  {obst:<8} all-clear up to "
+                  f"{max(clear):.0f} km/h" if clear else f"  {obst:<8} no all-clear speed", end="")
+            print(f"; collisions from {min(hit):.0f} km/h "
+                  f"(worst impact {max(r['impact_speed_kmh'] for r in rows):.1f} km/h)")
         else:
-            print(f"  {obst:<8} COLLIDED at every speed tested "
-                  f"(from {min(unsafe):.0f} km/h)")
+            print(f"  {obst:<8} all-clear at every speed tested "
+                  f"(max {max(speeds):.0f} km/h)")
+
+        near = [r for r in rows
+                if r["outcome"] != "COLLISION" and r["min_gap_m"] < NEAR_MISS_M]
+        if near:
+            worst = min(near, key=lambda r: r["min_gap_m"])
+            print(f"  {'':<8} {len(near)} of these 'avoided' runs stopped within "
+                  f"{NEAR_MISS_M:.0f} m — worst {worst['min_gap_m']:.1f} m at "
+                  f"{worst['spec']['ego_speed_kmh']:.0f} km/h. Not a pass margin.")
 
     lat = [r["mean_latency_ms"] for r in recs if r["mean_latency_ms"]]
     if lat:
