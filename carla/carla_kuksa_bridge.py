@@ -11,13 +11,22 @@ Runs on Host (RTX 5090).
 
 import sys
 import os
+import pathlib
 import time
 import asyncio
 import socket
 import struct
 import threading
 import numpy as np
-import grpc
+
+# Shared VSS layer from <repo>/agent, resolved relative to this file.
+_AGENT_DIR = os.environ.get(
+    "VSDV_AGENT_DIR",
+    str(pathlib.Path(__file__).resolve().parent.parent / "agent"))
+if _AGENT_DIR not in sys.path:
+    sys.path.insert(0, _AGENT_DIR)
+
+from vss import VSS                      # noqa: E402
 
 # Add CARLA Python API to path
 CARLA_PATH = os.environ.get("CARLA_PATH", "/home/bk/carla/CARLA_0.9.15")
@@ -86,46 +95,48 @@ def on_camera_image(image):
 
 # ── VSS signal publisher ──────────────────────────────────────────────────────
 
-async def publish_signals(stub, vehicle):
-    """Read CARLA vehicle state and push VSS signals to Kuksa."""
-    from kuksa.val.v1 import val_pb2, types_pb2
+async def publish_signals(v: VSS, vehicle):
+    """
+    Read CARLA vehicle state and push VSS signals to Kuksa.
 
+    Every path below was checked against the live databroker (VSS 5.1). Two
+    paths this used to write do not exist in any VSS release and caused the
+    databroker to reject the ENTIRE SetRequest, so none of the ego signals ever
+    landed:
+        Vehicle.Powertrain.Accelerator.PedalPosition  -> Chassis, not Powertrain
+        Vehicle.CurrentLocation.Speed                 -> no such signal; the
+                                                         speed is Vehicle.Speed
+    SteeringWheel.Angle is also int16, not float — writing a float put the value
+    in the wrong protobuf oneof.
+    """
+    publish_errors = 0
     while True:
-        t = vehicle.get_transform()
-        v = vehicle.get_velocity()
+        v_vec = vehicle.get_velocity()
         c = vehicle.get_control()
         loc = vehicle.get_location()
 
-        speed_ms  = (v.x**2 + v.y**2 + v.z**2) ** 0.5
+        speed_ms = (v_vec.x**2 + v_vec.y**2 + v_vec.z**2) ** 0.5
         speed_kmh = speed_ms * 3.6
 
-        signal_values = {
-            "Vehicle.Speed":                          ("float",  speed_kmh),
-            "Vehicle.Chassis.SteeringWheel.Angle":    ("float",  c.steer * 540),
-            "Vehicle.Powertrain.Accelerator.PedalPosition": ("float", c.throttle * 100),
-            "Vehicle.CurrentLocation.Latitude":       ("double", loc.y * 0.000009),
-            "Vehicle.CurrentLocation.Longitude":      ("double", loc.x * 0.000009),
-            "Vehicle.CurrentLocation.Speed":          ("double", speed_ms),
+        values = {
+            "Vehicle.Speed":                             speed_kmh,
+            "Vehicle.Chassis.SteeringWheel.Angle":       int(round(c.steer * 540)),
+            "Vehicle.Chassis.Accelerator.PedalPosition": max(0, min(100, int(c.throttle * 100))),
+            # NOTE: CARLA map coordinates scaled into degrees — a placeholder
+            # projection, not a real geodetic transform.
+            "Vehicle.CurrentLocation.Latitude":          loc.y * 0.000009,
+            "Vehicle.CurrentLocation.Longitude":         loc.x * 0.000009,
         }
 
-        updates = []
-        for path, (sig_type, value) in signal_values.items():
-            dp = types_pb2.Datapoint()
-            if sig_type == "float":
-                dp.float = float(value)
-            elif sig_type == "double":
-                dp.double = float(value)
-            updates.append(val_pb2.EntryUpdate(
-                entry=types_pb2.DataEntry(path=path, value=dp),
-                fields=[types_pb2.Field.FIELD_VALUE],
-            ))
-
         try:
-            await stub.Set(val_pb2.SetRequest(updates=updates))
-            print(f"[VSS] Speed={speed_kmh:.1f}km/h  Steer={c.steer*540:.1f}°  "
-                  f"Throttle={c.throttle*100:.0f}%  GPS=({loc.y:.4f},{loc.x:.4f})")
+            await v.set(values)
+            print(f"[VSS] Speed={speed_kmh:6.1f}km/h  Steer={c.steer*540:7.1f}deg  "
+                  f"Throttle={c.throttle*100:3.0f}%  "
+                  f"GPS=({loc.y*0.000009:.6f},{loc.x*0.000009:.6f})")
         except Exception as e:
-            print(f"[Kuksa] Error: {e}")
+            publish_errors += 1
+            if publish_errors <= 3 or publish_errors % 50 == 0:
+                print(f"[Kuksa] publish failed ({publish_errors}): {e}")
 
         await asyncio.sleep(0.2)   # 5 Hz VSS updates
 
@@ -163,20 +174,16 @@ async def main():
     t.start()
 
     # Connect to Kuksa
-    channel = grpc.aio.insecure_channel(f"{KUKSA_HOST}:{KUKSA_PORT}")
-    from kuksa.val.v1 import val_pb2_grpc
-    stub = val_pb2_grpc.VALStub(channel)
-    print(f"[Kuksa] Connected to {KUKSA_HOST}:{KUKSA_PORT}")
-
     try:
-        await publish_signals(stub, vehicle)
+        async with VSS(f"{KUKSA_HOST}:{KUKSA_PORT}") as v:
+            print(f"[Kuksa] Connected to {KUKSA_HOST}:{KUKSA_PORT}")
+            await publish_signals(v, vehicle)
     except KeyboardInterrupt:
         print("\n[Bridge] Stopping...")
     finally:
         camera.stop()
         camera.destroy()
         vehicle.destroy()
-        await channel.close()
         print("[Bridge] Cleaned up.")
 
 

@@ -144,6 +144,14 @@
         <div class="sig-value" id="sig-obstacle" style="color:var(--green)">NONE</div>
       </div>
       <div class="sig">
+        <div class="sig-label">DISTANCE</div>
+        <div class="sig-value" id="sig-distance">—</div>
+      </div>
+      <div class="sig">
+        <div class="sig-label">TIME TO COLLISION</div>
+        <div class="sig-value" id="sig-ttc">—</div>
+      </div>
+      <div class="sig">
         <div class="sig-label">TRT LATENCY</div>
         <div class="sig-value" id="sig-latency">0ms</div>
       </div>
@@ -295,8 +303,18 @@ function update(d) {
   document.getElementById('sig-latency').textContent = d.latency_ms.toFixed(1) + 'ms';
 
   const obsEl = document.getElementById('sig-obstacle');
-  obsEl.textContent = d.obstacle ? 'DETECTED' : 'NONE';
+  obsEl.textContent = d.obstacle ? d.obstacle + ' DETECTED' : 'NONE';
   obsEl.style.color = d.obstacle ? '#f85149' : '#3fb950';
+
+  // 999 is the ADAS node's "no obstacle" sentinel — render it as empty, not as
+  // a real 999 m reading.
+  const distEl = document.getElementById('sig-distance');
+  distEl.textContent = (d.distance >= 999) ? '—' : d.distance.toFixed(1) + 'm';
+  distEl.style.color = (d.distance >= 999) ? '' : (d.distance < 12 ? '#f85149' : '');
+
+  const ttcEl = document.getElementById('sig-ttc');
+  ttcEl.textContent = (d.ttc >= 999) ? '—' : d.ttc.toFixed(1) + 's';
+  ttcEl.style.color = (d.ttc >= 999) ? '' : (d.ttc < 1.6 ? '#f85149' : '');
 
   const ebaEl = document.getElementById('sig-eba');
   ebaEl.textContent = d.aeb ? 'ON ⚡' : 'OFF';

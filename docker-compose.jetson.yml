@@ -12,7 +12,11 @@ services:
     restart: unless-stopped
 
   adas-inference:
-    build: ./adas
+    # Context is the repo root so the image can include agent/vss.py, which the
+    # node imports. Building from ./adas cannot see it and fails at import.
+    build:
+      context: .
+      dockerfile: adas/Dockerfile
     container_name: vsdv-adas
     runtime: nvidia
     environment:
@@ -21,7 +25,10 @@ services:
       - CARLA_HOST=${CARLA_HOST:-192.168.55.100}
       - CARLA_CAM_PORT=9999
     volumes:
-      - trt-models:/app
+      # Mount the engine cache on a SUBPATH. Mounting it at /app shadows the
+      # image's own code, so a rebuilt image would keep running whatever source
+      # the old volume still held.
+      - trt-models:/app/models
     networks:
       - vsdv-net
     depends_on:

@@ -1,192 +1,127 @@
 #!/usr/bin/env python3
 """
-vSDV Vehicle App: Autonomous Emergency Braking (AEB)
-Runs on Jetson Nano.
+vSDV Vehicle App: Autonomous Emergency Braking (AEB) — Jetson Orin Nano
 
-Subscribes to ADAS signals from Kuksa Databroker.
-Applies graduated virtual braking based on obstacle proximity.
-Publishes brake commands back to Kuksa.
+Consumes *perception* signals from the Kuksa Databroker and owns *actuation*:
+this node is the only writer of the brake pedal and the EBA engagement flag.
 
-Braking logic:
-  dist > 10m  : no action
-  5 – 10m     : warning  + light brake  (30%)
-  3 – 5m      : caution  + firm brake   (70%)
-  < 3m        : EMERGENCY brake         (100%) + AEB engaged
+Subscribes:
+    Vehicle.ADAS.ObstacleDetection.DistanceToObject  float  m
+    Vehicle.ADAS.ObstacleDetection.TimeToCollision   float  s
+    Vehicle.Speed                                    float  km/h
+Publishes:
+    Vehicle.Chassis.Brake.PedalPosition              uint8  percent
+    Vehicle.ADAS.EBA.IsEngaged                       bool
+
+Braking law — graduated on time-to-collision, with a distance backstop:
+    TTC > 2.6 s and dist > 12 m : release
+    TTC 1.6 – 2.6 s             : 30 %  partial
+    TTC 0.9 – 1.6 s             : 70 %  firm
+    TTC < 0.9 s  or dist < 4 m  : 100 % emergency, EBA engaged
 """
 
 import asyncio
-import grpc
+import os
+import pathlib
+import sys
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
-KUKSA_HOST = "127.0.0.1"
-KUKSA_PORT = 55555
+# The shared VSS layer lives in <repo>/agent. Resolve it relative to this file
+# so the same source runs from a git checkout and from the container image
+# (/app/adas/... + /app/agent/...). VSDV_AGENT_DIR overrides for odd layouts.
+_AGENT_DIR = os.environ.get(
+    "VSDV_AGENT_DIR",
+    str(pathlib.Path(__file__).resolve().parent.parent / "agent"))
+if _AGENT_DIR not in sys.path:
+    sys.path.insert(0, _AGENT_DIR)
 
-# Signals to subscribe
-SUB_SIGNALS = [
-    "Vehicle.ADAS.ObstacleDetection.IsWarning",  # collision warning
-    "Vehicle.Chassis.Brake.PedalPosition",        # distance hint (0-100)
-    "Vehicle.Speed",
-]
+from vss import VSS                      # noqa: E402
 
-# Signals to publish (actuator responses)
-SIG_AEB      = "Vehicle.ADAS.EBA.IsEngaged"      # Emergency Brake Assist
+KUKSA_HOST = os.environ.get("KUKSA_HOST", "127.0.0.1")
+CONTROL_HZ = float(os.environ.get("CONTROL_HZ", "10"))
+
+P = "Vehicle.ADAS.ObstacleDetection."
+SIG_DISTANCE = P + "DistanceToObject"
+SIG_TTC      = P + "TimeToCollision"
+SIG_SPEED    = "Vehicle.Speed"
 SIG_BRAKE    = "Vehicle.Chassis.Brake.PedalPosition"
+SIG_AEB      = "Vehicle.ADAS.EBA.IsEngaged"
+
+NO_OBSTACLE_M = 999.0
 
 
 @dataclass
 class VehicleState:
-    speed_kmh:  float = 0.0
-    distance:   float = 99.0
-    collision:  bool  = False
-    n_obstacles: int  = 0
-    brake_pct:  float = 0.0
-    aeb:        bool  = False
-    last_event: str   = "INIT"
+    speed_kmh: float = 0.0
+    distance_m: float = NO_OBSTACLE_M
+    ttc_s: float = NO_OBSTACLE_M
 
 
-# ── Braking logic ─────────────────────────────────────────────────────────────
-
-def compute_brake(state: VehicleState) -> tuple[float, bool, str]:
-    """
-    Returns (brake_pct, aeb_engaged, event_label).
-    Graduated response based on nearest obstacle distance.
-    """
-    d = state.distance
-    spd = state.speed_kmh
-
-    if d > 10.0 or spd < 0.5:
-        return 0.0, False, "CLEAR"
-    elif d > 5.0:
-        return 30.0, False, "WARNING"
-    elif d > 3.0:
-        return 70.0, False, "CAUTION"
-    else:
+def compute_brake(s: VehicleState) -> tuple[float, bool, str]:
+    """Return (brake_percent, eba_engaged, event_label)."""
+    if s.speed_kmh < 0.5:
+        return 0.0, False, "STOPPED"
+    if s.ttc_s < 0.9 or s.distance_m < 4.0:
         return 100.0, True, "EMERGENCY"
+    if s.ttc_s < 1.6:
+        return 70.0, False, "FIRM"
+    if s.ttc_s < 2.6:
+        return 30.0, False, "PARTIAL"
+    if s.distance_m < 12.0:
+        return 30.0, False, "PROXIMITY"
+    return 0.0, False, "CLEAR"
 
 
-# ── Kuksa helpers ─────────────────────────────────────────────────────────────
-
-async def publish_brake(stub, brake_pct: float, aeb: bool):
-    """Push brake commands to Kuksa."""
-    from kuksa.val.v1 import val_pb2, types_pb2
-
-    updates = []
-    for path, sig_type, value in [
-        (SIG_BRAKE, "uint8", brake_pct),
-        (SIG_AEB,   "bool",  aeb),
-    ]:
-        dp = types_pb2.Datapoint()
-        if sig_type == "uint8":
-            dp.uint32 = int(value)
-        elif sig_type == "bool":
-            dp.bool = bool(value)
-        updates.append(val_pb2.EntryUpdate(
-            entry=types_pb2.DataEntry(path=path, value=dp),
-            fields=[types_pb2.Field.FIELD_VALUE],
-        ))
-    try:
-        await stub.Set(val_pb2.SetRequest(updates=updates))
-    except Exception as e:
-        print(f"[Brake] Publish error: {e}")
-
-
-async def subscribe_one(stub, path: str, state: VehicleState):
-    """Subscribe to a single signal, retry on failure."""
-    from kuksa.val.v1 import val_pb2, types_pb2
+async def subscribe_loop(v: VSS, state: VehicleState):
+    paths = [SIG_DISTANCE, SIG_TTC, SIG_SPEED]
     while True:
         try:
-            req = val_pb2.SubscribeRequest(entries=[
-                val_pb2.SubscribeEntry(
-                    path=path,
-                    view=types_pb2.VIEW_CURRENT_VALUE,
-                    fields=[types_pb2.FIELD_VALUE],
-                )
-            ])
-            async for response in stub.Subscribe(req):
-                for update in response.updates:
-                    value = update.entry.value
-                    if path == "Vehicle.Speed":
-                        state.speed_kmh = value.float
-                    elif path == "Vehicle.Chassis.Brake.PedalPosition":
-                        # Distance hint: 100=closest(0m), 0=clear(10m+)
-                        state.distance = max(0.1, 10.0 - value.uint32 / 10.0)
-                    elif path == "Vehicle.ADAS.ObstacleDetection.IsWarning":
-                        state.collision = value.bool
-                    elif path == "Vehicle.ADAS.ObstacleDetection.IsActive":
-                        state.n_obstacles = 1 if value.bool else 0
+            async for delta in v.subscribe(paths):
+                if SIG_DISTANCE in delta and delta[SIG_DISTANCE] is not None:
+                    state.distance_m = float(delta[SIG_DISTANCE])
+                if SIG_TTC in delta and delta[SIG_TTC] is not None:
+                    state.ttc_s = float(delta[SIG_TTC])
+                if SIG_SPEED in delta and delta[SIG_SPEED] is not None:
+                    state.speed_kmh = float(delta[SIG_SPEED])
         except Exception as e:
-            print(f"[Sub] {path}: {e} — retrying in 2s")
+            print(f"[Sub] subscription lost: {e} — retrying in 2s", flush=True)
             await asyncio.sleep(2)
 
 
-async def subscribe_loop(stub, state: VehicleState):
-    """Subscribe to all signals concurrently."""
-    await asyncio.gather(*[subscribe_one(stub, p, state) for p in SUB_SIGNALS])
+async def control_loop(v: VSS, state: VehicleState):
+    print("[AEB] active — graduated braking on TTC\n", flush=True)
+    print(f"{'Time':>8} {'Speed':>9} {'Dist':>9} {'TTC':>7} {'Brake':>6} {'EBA':>4}  Event",
+          flush=True)
+    print("-" * 68, flush=True)
 
-
-# ── Main control loop ─────────────────────────────────────────────────────────
-
-async def control_loop(stub, state: VehicleState):
-    """Evaluate braking at 10 Hz and publish commands."""
-    prev_event = "INIT"
-    prev_brake = -1.0
-
-    print("[AEB]  Autonomous Emergency Braking — ACTIVE")
-    print("[AEB]  Monitoring Kuksa signals at 10 Hz\n")
-    print(f"{'Time':>8}  {'Speed':>8}  {'Dist':>8}  {'Obstacles':>9}  "
-          f"{'Brake':>7}  {'AEB':>5}  Event")
-    print("─" * 72)
-
+    prev = None
     while True:
-        brake_pct, aeb, event = compute_brake(state)
+        brake, eba, event = compute_brake(state)
+        try:
+            await v.set({SIG_BRAKE: int(brake), SIG_AEB: eba})
+        except Exception as e:
+            print(f"[AEB] publish failed: {e}", flush=True)
 
-        # Only publish and log on state change
-        if brake_pct != prev_brake or event != prev_event:
-            await publish_brake(stub, brake_pct, aeb)
+        if (brake, event) != prev:
+            print(f"{time.strftime('%H:%M:%S'):>8} {state.speed_kmh:>7.1f}kph "
+                  f"{state.distance_m:>7.1f}m {state.ttc_s:>6.1f}s "
+                  f"{brake:>5.0f}% {'ON' if eba else 'off':>4}  {event}"
+                  f"{'  <<< AEB' if eba else ''}", flush=True)
+            prev = (brake, event)
 
-            ts = time.strftime("%H:%M:%S")
-            aeb_str = "ON ⚡" if aeb else "off"
-            marker  = " ◀ AEB ENGAGED!" if aeb else (" ▲" if event != "CLEAR" else "")
+        await asyncio.sleep(1.0 / CONTROL_HZ)
 
-            print(f"{ts:>8}  {state.speed_kmh:>6.1f}km/h  "
-                  f"{state.distance:>6.1f}m  "
-                  f"{state.n_obstacles:>9}  "
-                  f"{brake_pct:>5.0f}%  "
-                  f"{aeb_str:>5}  "
-                  f"{event}{marker}")
-
-            state.brake_pct = brake_pct
-            state.aeb       = aeb
-            state.last_event = event
-            prev_brake = brake_pct
-            prev_event = event
-
-        await asyncio.sleep(0.1)   # 10 Hz
-
-
-# ── Entry point ───────────────────────────────────────────────────────────────
 
 async def main():
-    print(f"[AEB] Connecting to Kuksa @ {KUKSA_HOST}:{KUKSA_PORT} ...")
-    channel = grpc.aio.insecure_channel(f"{KUKSA_HOST}:{KUKSA_PORT}")
-    from kuksa.val.v1 import val_pb2_grpc
-    stub = val_pb2_grpc.VALStub(channel)
-
-    state = VehicleState()
-
-    print("[AEB] Subscribing to ADAS + vehicle signals...")
-    try:
-        await asyncio.gather(
-            subscribe_loop(stub, state),
-            control_loop(stub, state),
-        )
-    except KeyboardInterrupt:
-        print("\n[AEB] Stopped.")
-        # Release brakes on exit
-        await publish_brake(stub, 0.0, False)
-    finally:
-        await channel.close()
+    async with VSS(f"{KUKSA_HOST}:55555") as v:
+        print(f"[AEB] connected to Kuksa @ {KUKSA_HOST}:55555", flush=True)
+        state = VehicleState()
+        try:
+            await asyncio.gather(subscribe_loop(v, state), control_loop(v, state))
+        except KeyboardInterrupt:
+            print("\n[AEB] stopped — releasing brakes")
+            await v.set({SIG_BRAKE: 0, SIG_AEB: False})
 
 
 if __name__ == "__main__":

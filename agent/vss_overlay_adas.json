@@ -1,0 +1,43 @@
+{
+  "Vehicle": {
+    "type": "branch",
+    "description": "High-level vehicle data.",
+    "children": {
+      "ADAS": {
+        "type": "branch",
+        "description": "All Advanced Driver Assist Systems data.",
+        "children": {
+          "ObstacleDetection": {
+            "type": "branch",
+            "description": "Signals form Obstacle Sensor System.",
+            "children": {
+              "DistanceToObject": {
+                "datatype": "float",
+                "type": "sensor",
+                "unit": "m",
+                "description": "Longitudinal distance to the nearest detected obstacle. 999 when no obstacle is detected."
+              },
+              "TimeToCollision": {
+                "datatype": "float",
+                "type": "sensor",
+                "unit": "s",
+                "description": "Time to collision with the nearest obstacle at current closing speed. 999 when not closing."
+              },
+              "ObjectCount": {
+                "datatype": "uint8",
+                "type": "sensor",
+                "description": "Number of obstacles detected in the current frame."
+              },
+              "InferenceLatency": {
+                "datatype": "float",
+                "type": "sensor",
+                "unit": "ms",
+                "description": "Wall-clock latency of the perception network for the current frame."
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}

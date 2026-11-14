@@ -35,8 +35,10 @@ vehicle_state = {
     "lon":        -122.4194,
     "brake":       0,
     "aeb":         False,
-    "obstacle":    False,
+    "obstacle":    0,          # ObjectCount — 0 means nothing detected
     "warning":     False,
+    "distance":    999.0,      # 999 = no obstacle, matching the ADAS node
+    "ttc":         999.0,
     "latency_ms":  0.0,
     "timestamp":   0,
 }
@@ -87,15 +89,23 @@ async def kuksa_subscriber():
 
     SIGNAL_MAP = {
         "Vehicle.Speed":                             ("speed",    "float"),
-        "Vehicle.Chassis.SteeringWheel.Angle":       ("steer",    "float"),
-        "Vehicle.Chassis.Brake.PedalPosition":       ("brake",    "uint32"),
+        "Vehicle.Chassis.SteeringWheel.Angle":             ("steer",      "int32"),
+        "Vehicle.Chassis.Brake.PedalPosition":             ("brake",      "uint32"),
+        "Vehicle.Chassis.Accelerator.PedalPosition":       ("throttle",   "uint32"),
         "Vehicle.CurrentLocation.Latitude":          ("lat",      "double"),
         "Vehicle.CurrentLocation.Longitude":         ("lon",      "double"),
-        "Vehicle.ADAS.ObstacleDetection.IsWarning":  ("warning",  "bool"),
-        "Vehicle.ADAS.ObstacleDetection.IsActive":   ("obstacle", "bool"),
-        "Vehicle.ADAS.EBA.IsEngaged":                ("aeb",      "bool"),
-        "Vehicle.ADAS.CruiseControl.SpeedSet":       ("latency_ms", "float"),
+        "Vehicle.ADAS.ObstacleDetection.IsWarning":        ("warning",    "bool"),
+        "Vehicle.ADAS.ObstacleDetection.ObjectCount":      ("obstacle",   "uint32"),
+        "Vehicle.ADAS.ObstacleDetection.DistanceToObject": ("distance",   "float"),
+        "Vehicle.ADAS.ObstacleDetection.TimeToCollision":  ("ttc",        "float"),
+        "Vehicle.ADAS.ObstacleDetection.InferenceLatency": ("latency_ms", "float"),
+        "Vehicle.ADAS.EBA.IsEngaged":                      ("aeb",        "bool"),
     }
+    # NOTE: IsActive and CruiseControl.SpeedSet used to appear here. IsActive
+    # exists in neither VSS 4.0 nor 5.1 — that subscription could never bind —
+    # and SpeedSet was carrying inference latency. The ADAS node now publishes
+    # ObjectCount / DistanceToObject / TimeToCollision / InferenceLatency from
+    # the agent/vss_overlay_adas.json overlay instead.
 
     while True:
         try:
@@ -133,6 +143,9 @@ async def subscribe_signal(stub, path, key, typ, types_pb2, val_pb2):
                         vehicle_state[key] = v.bool
                     elif typ == "uint32":
                         vehicle_state[key] = v.uint32
+                    elif typ == "int32":
+                        # int8/int16/int32 all ride in the int32 oneof field
+                        vehicle_state[key] = v.int32
                     vehicle_state["timestamp"] = int(time.time() * 1000)
         except Exception:
             await asyncio.sleep(2)
