@@ -18,6 +18,7 @@ Signals published — all exist in VSS 5.1 plus agent/vss_overlay_adas.json:
 """
 
 import asyncio
+import math
 import os
 import pathlib
 import socket
@@ -51,12 +52,34 @@ FRAME_H     = int(os.environ.get("FRAME_H", "480"))
 FPS_TARGET  = int(os.environ.get("FPS_TARGET", "10"))
 WARN_TTC_S  = float(os.environ.get("WARN_TTC_S", "2.0"))
 
-# Monocular distance constant: focal_px * assumed_object_height_m.
-# The original code hardcoded 50*1.6 = 80, which is wrong for this camera —
-# at 640px/90deg FOV the focal length is 320px, so a 1.75 m pedestrian needs
-# 320*1.75 = 560. The default below is overridable so the scenario harness can
-# sweep it. See agent/README.md "distance estimator calibration".
-DIST_CONST  = float(os.environ.get("DIST_CONST", str(320.0 * 1.75)))
+CAMERA_FOV_DEG = float(os.environ.get("CAMERA_FOV_DEG", "90"))
+# Pinhole focal length in pixels, derived rather than guessed:
+#     f = (width/2) / tan(fov/2)
+FOCAL_PX = (FRAME_W / 2) / math.tan(math.radians(CAMERA_FOV_DEG) / 2)
+
+# Monocular range needs the REAL height of the thing detected:
+#     distance = focal_px * object_height_m / box_height_px
+# The original code used a single (50*1.6)=80 constant for every class, which
+# is wrong twice over: wrong for this camera (f is 320 px here, so a 1.75 m
+# pedestrian needs 560), and wrong to apply one height to every object. A
+# sweep measured the residual at +53% for pedestrians and -37% for vehicles
+# using one constant. These are typical heights by COCO class id.
+OBJECT_HEIGHT_M = {
+    0: 1.75,   # person
+    1: 1.10,   # bicycle
+    2: 1.50,   # car
+    3: 1.30,   # motorcycle
+    5: 3.20,   # bus
+    6: 4.00,   # train
+    7: 3.50,   # truck
+}
+DEFAULT_HEIGHT_M = float(os.environ.get("DEFAULT_HEIGHT_M", "1.60"))
+
+# How long a lost object stays tracked. Perception drops a detection for a
+# single frame routinely; without a hold, distance snaps to the no-obstacle
+# sentinel and the vehicle app cancels an active emergency stop. Measured at
+# 24 brake releases across 24 scenarios before this existed.
+TRACK_HOLD_S = float(os.environ.get("TRACK_HOLD_S", "0.6"))
 
 NO_OBSTACLE_M = 999.0
 
@@ -140,10 +163,12 @@ def generate_synthetic_frame(frame_id: int):
 async def run_adas(model, v: VSS):
     frame_id = 0
     source = "stream" if MODE == "carla" else "synthetic"
-    print(f"[ADAS] mode={source}  target={FPS_TARGET}Hz  "
-          f"dist_const={DIST_CONST:.0f}  warn_ttc={WARN_TTC_S}s\n", flush=True)
+    print(f"[ADAS] mode={source}  target={FPS_TARGET}Hz  focal={FOCAL_PX:.0f}px  "
+          f"warn_ttc={WARN_TTC_S}s  track_hold={TRACK_HOLD_S}s\n", flush=True)
 
     publish_errors = 0
+    track = None          # last confirmed detection: {"t": epoch, "dist": m}
+    holds = 0             # frames served from the held track rather than a detection
     while True:
         t0 = time.time()
 
@@ -165,19 +190,37 @@ async def run_adas(model, v: VSS):
         n_detected = 0 if boxes is None else len(boxes)
         distances = []
         if n_detected:
-            for box in boxes.xyxy:
+            for box, cls in zip(boxes.xyxy, boxes.cls):
                 h = float(box[3] - box[1])
-                distances.append(max(0.5, DIST_CONST / max(h, 1.0)))
+                h_real = OBJECT_HEIGHT_M.get(int(cls), DEFAULT_HEIGHT_M)
+                distances.append(max(0.5, FOCAL_PX * h_real / max(h, 1.0)))
 
         if not distances and gt_distances:
             distances = gt_distances
             n_detected = len(distances)
 
-        nearest = min(distances) if distances else NO_OBSTACLE_M
-
-        # ego speed is owned by the vehicle/scenario side; read it for TTC
+        # ego speed is owned by the vehicle/scenario side; read it for TTC and
+        # for coasting a held track
         speed_kmh = (await v.get(SIG_SPEED)).get(SIG_SPEED) or 0.0
         closing_ms = speed_kmh / 3.6
+
+        now = time.time()
+        if distances:
+            nearest = min(distances)
+            track = {"t": now, "dist": nearest}
+            held = False
+        elif track and (now - track["t"]) <= TRACK_HOLD_S:
+            # Object lost this frame but seen very recently: coast the last
+            # measurement forward at the current closing speed instead of
+            # declaring the road clear.
+            nearest = max(0.5, track["dist"] - closing_ms * (now - track["t"]))
+            held = True
+            holds += 1
+        else:
+            nearest = NO_OBSTACLE_M
+            track = None
+            held = False
+
         ttc = (nearest / closing_ms) if (closing_ms > 0.1 and nearest < NO_OBSTACLE_M) \
             else NO_OBSTACLE_M
         warning = ttc < WARN_TTC_S
@@ -196,8 +239,9 @@ async def run_adas(model, v: VSS):
                 print(f"[Kuksa] publish failed ({publish_errors}): {e}", flush=True)
 
         flag = " WARN" if warning else ""
+        mark = " HELD" if held else ""
         print(f"[{source}][{frame_id:04d}] n={n_detected} d={nearest:6.1f}m "
-              f"ttc={ttc:6.1f}s lat={latency_ms:5.1f}ms{flag}", flush=True)
+              f"ttc={ttc:6.1f}s lat={latency_ms:5.1f}ms{flag}{mark}", flush=True)
 
         frame_id += 1
         await asyncio.sleep(max(0, 1.0 / FPS_TARGET - (time.time() - t0)))

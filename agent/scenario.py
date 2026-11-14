@@ -222,13 +222,14 @@ def dut_estimate_m(obstacle: str, true_distance_m: float,
     """
     What adas_inference.py will estimate for this true distance.
 
-    The DUT uses dist = (50 * 1.6) / box_height_px for every class, i.e. it
-    assumes focal*height == 80. Reproduced here so the harness can report the
-    estimator's bias without needing the DUT in the loop.
+    The DUT now uses per-class heights: dist = focal_px * height_m / box_px.
+    With a correct class and a tight box this is exact, so the residual the
+    harness reports is attributable to box error and misclassification rather
+    than to a wrong constant.
     """
     cam = camera or Camera()
     h_px = cam.object_height_px(obstacle, true_distance_m)
-    return (50 * 1.6) / max(h_px, 1.0)
+    return cam.focal_px * OBSTACLE_HEIGHT_M[obstacle] / max(h_px, 1.0)
 
 
 if __name__ == "__main__":

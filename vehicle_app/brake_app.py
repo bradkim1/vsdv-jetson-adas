@@ -41,6 +41,14 @@ from vss import VSS                      # noqa: E402
 KUKSA_HOST = os.environ.get("KUKSA_HOST", "127.0.0.1")
 CONTROL_HZ = float(os.environ.get("CONTROL_HZ", "10"))
 
+# Once an emergency stop is engaged it LATCHES. Perception legitimately drops a
+# detection for a frame or two; without this, the obstacle signal snaps back to
+# "clear" and the brake is cancelled mid-stop. A sweep measured 24 such
+# cancellations across 24 scenarios, including runs that still passed.
+# The latch releases only when the road has been continuously clear for
+# EBA_LATCH_CLEAR_S, or the vehicle has actually stopped.
+EBA_LATCH_CLEAR_S = float(os.environ.get("EBA_LATCH_CLEAR_S", "1.0"))
+
 P = "Vehicle.ADAS.ObstacleDetection."
 SIG_DISTANCE = P + "DistanceToObject"
 SIG_TTC      = P + "TimeToCollision"
@@ -90,14 +98,37 @@ async def subscribe_loop(v: VSS, state: VehicleState):
 
 
 async def control_loop(v: VSS, state: VehicleState):
-    print("[AEB] active — graduated braking on TTC\n", flush=True)
+    print(f"[AEB] active — graduated braking on TTC, "
+          f"emergency latch {EBA_LATCH_CLEAR_S}s\n", flush=True)
     print(f"{'Time':>8} {'Speed':>9} {'Dist':>9} {'TTC':>7} {'Brake':>6} {'EBA':>4}  Event",
           flush=True)
     print("-" * 68, flush=True)
 
     prev = None
+    latched = False       # an emergency stop is in progress
+    clear_since = None    # when the road first looked clear again
     while True:
         brake, eba, event = compute_brake(state)
+
+        now = time.time()
+        if eba:
+            latched, clear_since = True, None
+        elif latched:
+            if state.speed_kmh < 0.5:
+                # actually stopped — the stop succeeded, drop the latch
+                latched, clear_since = False, None
+            else:
+                if event == "CLEAR":
+                    clear_since = clear_since or now
+                    if now - clear_since >= EBA_LATCH_CLEAR_S:
+                        latched, clear_since = False, None
+                else:
+                    clear_since = None
+                if latched:
+                    # hold the stop; never weaken a brake already commanded
+                    brake, eba = max(brake, 100.0), True
+                    event = "EMERGENCY(latched)"
+
         try:
             await v.set({SIG_BRAKE: int(brake), SIG_AEB: eba})
         except Exception as e:

@@ -19,6 +19,7 @@ import argparse
 import asyncio
 import json
 import math
+import os
 import time
 
 from scenario import (ScenarioSpec, EgoState, Renderer, Camera,
@@ -86,11 +87,44 @@ class FrameServer:
             await self._server.wait_closed()
 
 
+# The DUT carries state across a scenario boundary and a real vehicle has no
+# such boundary, so the harness must drain it explicitly:
+#   - the perception node holds a lost object for TRACK_HOLD_S (0.6 s default)
+#   - the vehicle app latches an engaged emergency stop until clear or stopped
+# A fixed sleep shorter than the track hold lets the previous scenario's
+# obstacle reappear at t=0: the car brakes immediately and stops before the new
+# obstacle is ever in range, which reads as "avoided, never detected".
+SETTLE_MIN_S = float(os.environ.get("SETTLE_MIN_S", "1.2"))   # must exceed TRACK_HOLD_S
+SETTLE_TIMEOUT_S = 8.0
+
+
 async def _reset(v: VSS):
-    """Put the signal plane in a known state between scenarios."""
-    await v.set({SIG_SPEED: 0.0, SIG_DISTANCE: 999.0, P + "TimeToCollision": 999.0,
-                 SIG_COUNT: 0, SIG_WARNING: False})
-    await asyncio.sleep(0.4)
+    """
+    Put the signal plane in a known state AND wait for the DUT to actually settle.
+
+    Both conditions matter. The minimum dwell outlives the perception track;
+    the poll then confirms the DUT itself reports a clear road with the brake
+    released, rather than trusting a timer. No frames are streamed during this
+    window, so perception goes quiet and the track ages out.
+    """
+    t0 = time.time()
+    deadline = t0 + SETTLE_TIMEOUT_S
+    while True:
+        await v.set({SIG_SPEED: 0.0, SIG_DISTANCE: 999.0, P + "TimeToCollision": 999.0,
+                     SIG_COUNT: 0, SIG_WARNING: False})
+        await asyncio.sleep(0.15)
+        got = await v.get(SIG_DISTANCE, SIG_BRAKE, SIG_AEB)
+        quiet = ((got.get(SIG_DISTANCE) or 999.0) >= 900.0
+                 and float(got.get(SIG_BRAKE) or 0.0) == 0.0
+                 and not bool(got.get(SIG_AEB)))
+        waited = time.time() - t0
+        if quiet and waited >= SETTLE_MIN_S:
+            return
+        if waited >= SETTLE_TIMEOUT_S or time.time() > deadline:
+            print(f"[runner] WARNING: DUT did not settle in {waited:.1f}s "
+                  f"(dist={got.get(SIG_DISTANCE)} brake={got.get(SIG_BRAKE)} "
+                  f"aeb={got.get(SIG_AEB)}) — scenario may be contaminated")
+            return
 
 
 async def run_scenario(spec: ScenarioSpec, frames: FrameServer, v: VSS,
